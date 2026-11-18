@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>아스키 플레이어</title>
+<style>
+  :root { --bg: #0b0d10; --panel: #15191e; --line: #2a3038; --text: #e6e9ed; --dim: #8b949e; --accent: #4ade80; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 -apple-system, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif; }
+  main { max-width: 1800px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 16px; margin: 0 0 12px; font-weight: 600; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin-bottom: 8px; }
+  input[type=url] { flex: 1 1 320px; min-width: 0; padding: 8px 10px; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; font: inherit; }
+  button, .file { padding: 8px 14px; border-radius: 6px; border: 1px solid var(--line); background: #1f252c; color: var(--text); font: inherit; cursor: pointer; white-space: nowrap; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #052e16; font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  .file input { display: none; }
+  label.opt { display: flex; align-items: center; gap: 6px; color: var(--dim); white-space: nowrap; }
+  input[type=range] { accent-color: var(--accent); }
+  #seek { flex: 1 1 200px; min-width: 0; }
+  #status { color: var(--dim); min-height: 21px; margin: 4px 2px 8px; }
+  #status.error { color: #f87171; }
+  #stage { background: #000; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; line-height: 0; }
+  #out { display: block; width: 100%; height: auto; }
+  /* 영상 요소는 오디오와 프레임 공급원으로만 쓰고 화면에는 보이지 않게 한다. */
+  #video { position: fixed; left: -10px; top: -10px; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  .num { font-variant-numeric: tabular-nums; color: var(--dim); white-space: nowrap; }
+</style>
+</head>
+<body>
+<main>
+  <h1>아스키 플레이어</h1>
+  <form class="bar" id="form">
+    <input type="url" id="url" placeholder="유튜브 링크를 붙여 넣으세요" autocomplete="off">
+    <button class="primary" id="go" type="submit">재생하기</button>
+    <label class="file">파일 열기<input type="file" id="file" accept="video/*"></label>
+  </form>
+  <div class="bar">
+    <button id="toggle" type="button" disabled>일시정지</button>
+    <input type="range" id="seek" min="0" max="1" step="0.01" value="0" disabled aria-label="재생 위치">
+    <span class="num" id="time">0:00 / 0:00</span>
+    <label class="opt">가로 글자 수 <input type="range" id="cols" min="60" max="400" step="10" value="300"><span class="num" id="colsValue">300</span></label>
+    <label class="opt"><input type="checkbox" id="color" checked> 색상</label>
+  </div>
+  <div id="status">링크를 넣고 재생하기를 누르세요.</div>
+  <div id="stage"><canvas id="out" width="16" height="9"></canvas></div>
+  <video id="video" playsinline preload="auto"></video>
+</main>
+<script>
+const RAMP = " .'`^\",:;Il!i><~+_-?][}{1)(|/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$";
+const FONT = 'Menlo, Consolas, "DejaVu Sans Mono", monospace';
+const $ = (id) => document.getElementById(id);
+const video = $("video"), out = $("out"), statusEl = $("status");
+const octx = out.getContext("2d");
+const sample = document.createElement("canvas");
+const sctx = sample.getContext("2d", { willReadFrequently: true });
+
+// 밝기 0~255 를 글자 코드로 바꾸는 표.
+const lut = new Uint8Array(256);
+for (let v = 0; v < 256; v++) lut[v] = RAMP.charCodeAt(Math.floor(v * (RAMP.length - 1) / 255));
+
+// VS Code 내장 브라우저처럼 AAC 오디오를 못 트는 환경에서는 소리가 나지 않는다.
+const noAac = !video.canPlayType('audio/mp4; codecs="mp4a.40.2"');
+
+let cols = 300, rows = 0, lineHeight = 0, rowCodes = null, objectUrl = null;
+
+function setStatus(text, isError) {
+  statusEl.textContent = text;
+  statusEl.classList.toggle("error", !!isError);
+}
+
+function fmt(t) {
+  if (!isFinite(t)) return "0:00";
+  const s = Math.floor(t % 60);
+  return Math.floor(t / 60) + ":" + (s < 10 ? "0" : "") + s;
+}
+
+// 격자 크기와 글꼴 크기를 정한다. 글자는 화면 폭을 채우되 실제 픽셀 기준으로 그려 선명하게 한다.
+function layout() {
+  if (!video.videoWidth) return;
+  const targetWidth = $("stage").clientWidth * (window.devicePixelRatio || 1);
+  octx.font = "100px " + FONT;
+  const advancePerPx = octx.measureText("M".repeat(100)).width / 100 / 100;
+  const fontPx = Math.max(4, Math.floor(targetWidth / cols / advancePerPx));
+  octx.font = fontPx + "px " + FONT;
+  const width = Math.ceil(octx.measureText("M".repeat(cols)).width);
+  lineHeight = fontPx;
+  rows = Math.max(1, Math.round(width * video.videoHeight / video.videoWidth / lineHeight));
+  out.width = width;
+  out.height = rows * lineHeight;
+  // 캔버스 크기를 바꾸면 그리기 상태가 초기화되므로 다시 지정한다.
+  octx.font = fontPx + "px " + FONT;
+  octx.textBaseline = "top";
+  sample.width = cols;
+  sample.height = rows;
+  rowCodes = new Uint8Array(cols);
+  render();
+}
+
+function render() {
+  if (!rows || video.readyState < 2) return;
+  sctx.drawImage(video, 0, 0, cols, rows);
+  const px = sctx.getImageData(0, 0, cols, rows).data;
+  const color = $("color").checked;
+  octx.globalCompositeOperation = "source-over";
+  octx.filter = "none";
+  octx.clearRect(0, 0, out.width, out.height);
+  octx.fillStyle = color ? "#fff" : "#d6ffe0";
+  let i = 0;
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++, i += 4) {
+      rowCodes[x] = lut[(px[i] * 77 + px[i + 1] * 150 + px[i + 2] * 29) >> 8];
+    }
+    octx.fillText(String.fromCharCode.apply(null, rowCodes), 0, y * lineHeight);
+  }
+  if (color) {
+    // 흰 글자 위에 축소한 영상 프레임을 겹쳐, 글자가 있는 자리만 그 칸의 색으로 물들인다.
+    octx.globalCompositeOperation = "source-in";
+    octx.imageSmoothingEnabled = false;
+    // 글자 농도가 이미 밝기를 표현하므로 색은 조금 밝게 올린다.
+    octx.filter = "brightness(1.35) saturate(1.2)";
+    octx.drawImage(sample, 0, 0, out.width, out.height);
+  }
+}
+
+// 영상 프레임이 화면에 나갈 때마다 그려서 오디오와 어긋나지 않게 한다.
+const hasFrameCallback = "requestVideoFrameCallback" in HTMLVideoElement.prototype;
+function onFrame() {
+  render();
+  if (hasFrameCallback) video.requestVideoFrameCallback(onFrame);
+  else if (!video.paused && !video.ended) requestAnimationFrame(onFrame);
+}
+
+function load(src, label) {
+  video.src = src;
+  video.load();
+  setStatus(label + " 불러오는 중...");
+  video.play().then(
+    () => setStatus(label + " 재생 중"),
+    () => setStatus("재생을 시작하지 못했습니다. 일시정지 버튼 옆의 재생을 눌러 보세요.", true));
+}
+
+$("form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const url = $("url").value.trim();
+  if (!url) return setStatus("링크를 넣어 주세요.", true);
+  $("go").disabled = true;
+  setStatus("영상을 내려받는 중... 길이에 따라 수십 초가 걸릴 수 있습니다.");
+  try {
+    const res = await fetch("/api/fetch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, opus: noAac }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "내려받기에 실패했습니다.");
+    load("/video/" + data.id, "영상");
+  } catch (err) {
+    setStatus(err.message, true);
+  } finally {
+    $("go").disabled = false;
+  }
+});
+
+$("file").addEventListener("change", (event) => {
+  const file = event.target.files[0];
+  if (!file) return;
+  if (objectUrl) URL.revokeObjectURL(objectUrl);
+  objectUrl = URL.createObjectURL(file);
+  load(objectUrl, file.name);
+  if (noAac) setStatus("이 브라우저는 AAC 오디오를 지원하지 않아 소리가 안 날 수 있습니다. Chrome 에서 열어 주세요.", true);
+});
+
+video.addEventListener("loadedmetadata", () => {
+  $("seek").max = video.duration || 1;
+  $("seek").disabled = false;
+  $("toggle").disabled = false;
+  layout();
+});
+video.addEventListener("loadeddata", () => { render(); if (hasFrameCallback) video.requestVideoFrameCallback(onFrame); });
+video.addEventListener("play", () => { $("toggle").textContent = "일시정지"; if (!hasFrameCallback) requestAnimationFrame(onFrame); });
+video.addEventListener("pause", () => { $("toggle").textContent = "재생"; });
+video.addEventListener("seeked", render);
+video.addEventListener("timeupdate", () => {
+  $("seek").value = video.currentTime;
+  $("time").textContent = fmt(video.currentTime) + " / " + fmt(video.duration);
+});
+video.addEventListener("error", () => setStatus("이 브라우저에서 재생할 수 없는 영상입니다.", true));
+
+$("toggle").addEventListener("click", () => { video.paused ? video.play() : video.pause(); });
+$("seek").addEventListener("input", () => { video.currentTime = Number($("seek").value); });
+$("cols").addEventListener("input", () => {
+  cols = Number($("cols").value);
+  $("colsValue").textContent = cols;
+  layout();
+});
+$("color").addEventListener("change", render);
+window.addEventListener("resize", layout);
+</script>
+</body>
+</html>

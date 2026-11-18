@@ -1,0 +1,3 @@
+.vscode/
+.playwright-mcp/
+__pycache__/
